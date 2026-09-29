@@ -94,14 +94,13 @@ All endpoints are `GET`.
 
 ## Deploy (InstaCloud)
 
-Link a checkout once with `insta project link <project-id>`, then deploy from the repo root:
+Every push to `main` deploys automatically: InstaCloud's GitHub App builds the Dockerfile
+(typecheck and tests included; a failing build leaves the live version running) and rolls
+the `app` service. The `/data` volume persists across deploys.
 
-```sh
-insta deploy . --group app --port 8080
-```
-
-The upload is built remotely from the Dockerfile (tests included), and the `/data` volume
-persists across deploys.
+Manual `insta deploy .` uploads are refused while the service tracks this repository. Push to
+`main` instead, or preview a change first on its own environment with
+`insta branch create <name>`.
 
 ## Development
 
