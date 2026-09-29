@@ -1,0 +1,15 @@
+node_modules
+dist
+data
+*.db
+*.db-*
+.DS_Store
+docker-compose.yml
+
+# Local agent tooling and credentials — never part of a build context
+.insta
+.claude
+.codex
+.agents
+.github/skills
+skills-lock.json

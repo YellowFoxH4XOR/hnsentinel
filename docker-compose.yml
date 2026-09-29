@@ -1,0 +1,21 @@
+# docker compose up -d --build   →   http://localhost:8080
+name: hnsentinel
+
+services:
+  sentinel:
+    build: .
+    image: hn-sentinel:latest
+    container_name: hn-sentinel
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      BRIEF_HOUR_UTC: ${BRIEF_HOUR_UTC:-13}
+    volumes:
+      - sentinel-data:/data
+    stop_grace_period: 15s
+
+volumes:
+  sentinel-data:
