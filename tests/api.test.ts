@@ -19,6 +19,7 @@ const status: Status = {
   storiesTracked: 2,
   risingCount: 0,
   latestSignalAt: null,
+  trajectoriesArchived: 0,
 }
 
 let base = ''

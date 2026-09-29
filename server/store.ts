@@ -1,3 +1,4 @@
+import { gunzipSync, gzipSync } from 'node:zlib'
 import type { Brief, BriefSummary, FeedKind, Momentum, Signal, SignalKind, Snapshot, Story } from '../shared/types.ts'
 import { FEED_KINDS } from '../shared/types.ts'
 import { transaction, type Database } from './db.ts'
@@ -17,6 +18,48 @@ export const MILESTONES = [100, 250, 500] as const
 export const HIGH_FREQUENCY_MAX_AGE = 270_000
 const SECONDARY_CADENCE = 15 * MINUTE
 const BRIEF_PAYLOAD_VERSION = 1
+
+/** A story's trajectory covers its first day and is archived once that day is over. */
+export const TRAJECTORY_HORIZON = DAY
+/** Sampling of an archived trajectory: fine while stories take off, coarse afterwards. */
+const TRAJECTORY_FINE_WINDOW = 6 * HOUR
+const TRAJECTORY_FINE_STEP = 5 * MINUTE
+const TRAJECTORY_COARSE_STEP = 30 * MINUTE
+/** Gaps longer than this don't count toward time on the front page. */
+const FRONT_PAGE_GAP_CAP = 15 * MINUTE
+export const FRONT_PAGE_RANK = 30
+const TRAJECTORY_BATCH = 500
+const TRAJECTORY_SERIES_VERSION = 1
+
+/** One point of an archived trajectory: minutes since creation, score, comments, front-page rank. */
+export type TrajectoryPoint = [minute: number, score: number | null, comments: number | null, rank: number | null]
+
+/** The long-term record of one story's first day. */
+export interface Trajectory {
+  storyId: number
+  type: string
+  title: string
+  domain: string | null
+  author: string | null
+  createdAt: number
+  archivedAt: number
+  /** Raw observations inside the horizon (before downsampling). */
+  samples: number
+  firstObservedAt: number
+  lastObservedAt: number
+  /** Longest pause between observations; large values mean partial coverage. */
+  maxGapMinutes: number
+  maxScore: number | null
+  maxComments: number | null
+  finalScore: number | null
+  finalComments: number | null
+  /** Best (lowest) front-page rank observed, or null if never listed on Top. */
+  bestRank: number | null
+  frontPageMinutes: number
+  dead: boolean
+  deleted: boolean
+  points: TrajectoryPoint[]
+}
 
 export type RunOutcome = 'complete' | 'partial' | 'failed' | 'cancelled'
 
@@ -435,6 +478,62 @@ export class Store {
     })
   }
 
+  // MARK: - Long-term trajectories
+
+  /**
+   * Archives the first day of every story or poll that has just finished it, while its raw
+   * snapshots still exist (they are pruned after 48 hours). Each run handles a bounded batch and
+   * is idempotent; returns how many trajectories were written.
+   */
+  archiveTrajectories(now: number): number {
+    return transaction(this.db, () => {
+      const rows = this.db
+        .prepare(`SELECT s.* FROM stories s
+                  WHERE s.type IN ('story', 'poll') AND s.created_at >= ? AND s.created_at <= ?
+                    AND NOT EXISTS (SELECT 1 FROM trajectories t WHERE t.story_id = s.id)
+                    AND EXISTS (SELECT 1 FROM snapshots n WHERE n.story_id = s.id AND n.observed_at >= s.created_at AND n.observed_at <= s.created_at + ?)
+                  ORDER BY s.created_at LIMIT ?`)
+        .all(now - 2 * DAY, now - TRAJECTORY_HORIZON, TRAJECTORY_HORIZON, TRAJECTORY_BATCH) as unknown as StoryRow[]
+      if (!rows.length) return 0
+
+      const oldest = Math.min(...rows.map((row) => row.created_at!))
+      const history = this.historyByStory(rows.map((row) => row.id), oldest)
+      const insert = this.db.prepare(`
+        INSERT OR IGNORE INTO trajectories (story_id, type, title, domain, author, created_at, archived_at, samples,
+          first_observed_at, last_observed_at, max_gap_minutes, max_score, max_comments, final_score, final_comments,
+          best_rank, front_page_minutes, dead, deleted, series_version, series)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+
+      let written = 0
+      for (const row of rows) {
+        const createdAt = row.created_at!
+        const snapshots = (history.get(row.id) ?? []).filter(
+          (snapshot) => snapshot.observedAt >= createdAt && snapshot.observedAt <= createdAt + TRAJECTORY_HORIZON,
+        )
+        if (!snapshots.length) continue
+        const summary = summarizeTrajectory(snapshots)
+        const series = gzipSync(JSON.stringify(downsampleTrajectory(snapshots, createdAt)))
+        insert.run(
+          row.id, row.type, row.title, domainOf(safeUrl(row.url)?.href ?? null), row.author, createdAt, now, snapshots.length,
+          summary.firstObservedAt, summary.lastObservedAt, summary.maxGapMinutes, summary.maxScore, summary.maxComments,
+          summary.finalScore, summary.finalComments, summary.bestRank, summary.frontPageMinutes, row.dead, row.deleted,
+          TRAJECTORY_SERIES_VERSION, series,
+        )
+        written += 1
+      }
+      return written
+    })
+  }
+
+  trajectory(storyId: number): Trajectory | null {
+    const row = this.db.prepare('SELECT * FROM trajectories WHERE story_id = ?').get(storyId) as TrajectoryRow | undefined
+    return row ? toTrajectory(row) : null
+  }
+
+  trajectoryCount(): number {
+    return (this.db.prepare('SELECT count(*) AS count FROM trajectories').get() as { count: number }).count
+  }
+
   // MARK: - Retention
 
   /** Daily retention, at most once per UTC day. */
@@ -449,6 +548,7 @@ export class Store {
   /**
    * Snapshots and runs are kept 48 hours, signals 30 days, briefs 90 days. Stories are kept for
    * 60 days after their last observation, or while a feed or a retained signal references them.
+   * Archived trajectories are kept indefinitely.
    */
   prune(now: number): void {
     transaction(this.db, () => {
@@ -516,6 +616,103 @@ function mergeStory(existing: StoryRow | undefined, observation: Observation): S
     deleted: item.deleted ? 1 : 0,
     dead: item.dead ? 1 : 0,
     last_fetched_at: observation.observedAt,
+  }
+}
+
+interface TrajectoryRow {
+  story_id: number
+  type: string
+  title: string
+  domain: string | null
+  author: string | null
+  created_at: number
+  archived_at: number
+  samples: number
+  first_observed_at: number
+  last_observed_at: number
+  max_gap_minutes: number
+  max_score: number | null
+  max_comments: number | null
+  final_score: number | null
+  final_comments: number | null
+  best_rank: number | null
+  front_page_minutes: number
+  dead: number
+  deleted: number
+  series_version: number
+  series: Uint8Array
+}
+
+function toTrajectory(row: TrajectoryRow): Trajectory {
+  if (row.series_version !== TRAJECTORY_SERIES_VERSION) {
+    throw new Error(`Trajectory ${row.story_id} uses unsupported series version ${row.series_version}`)
+  }
+  return {
+    storyId: row.story_id,
+    type: row.type,
+    title: row.title,
+    domain: row.domain,
+    author: row.author,
+    createdAt: row.created_at,
+    archivedAt: row.archived_at,
+    samples: row.samples,
+    firstObservedAt: row.first_observed_at,
+    lastObservedAt: row.last_observed_at,
+    maxGapMinutes: row.max_gap_minutes,
+    maxScore: row.max_score,
+    maxComments: row.max_comments,
+    finalScore: row.final_score,
+    finalComments: row.final_comments,
+    bestRank: row.best_rank,
+    frontPageMinutes: row.front_page_minutes,
+    dead: row.dead === 1,
+    deleted: row.deleted === 1,
+    points: JSON.parse(gunzipSync(row.series).toString('utf8')) as TrajectoryPoint[],
+  }
+}
+
+/** Keeps the last observation in each 5-minute bucket for six hours, then each 30-minute bucket. */
+export function downsampleTrajectory(snapshots: Snapshot[], createdAt: number): TrajectoryPoint[] {
+  const buckets = new Map<number, Snapshot>()
+  for (const snapshot of [...snapshots].sort((a, b) => a.observedAt - b.observedAt)) {
+    const offset = Math.max(0, snapshot.observedAt - createdAt)
+    const bucket = offset < TRAJECTORY_FINE_WINDOW
+      ? Math.floor(offset / TRAJECTORY_FINE_STEP)
+      : 1_000_000 + Math.floor((offset - TRAJECTORY_FINE_WINDOW) / TRAJECTORY_COARSE_STEP)
+    buckets.set(bucket, snapshot)
+  }
+  return [...buckets.values()].map((snapshot) => [
+    Math.round(Math.max(0, snapshot.observedAt - createdAt) / MINUTE),
+    snapshot.score,
+    snapshot.comments,
+    snapshot.topRank,
+  ])
+}
+
+/** Outcome and coverage figures from the raw observations of a story's first day. */
+export function summarizeTrajectory(snapshots: Snapshot[]) {
+  const ordered = [...snapshots].sort((a, b) => a.observedAt - b.observedAt)
+  const scores = ordered.flatMap((snapshot) => (snapshot.score === null ? [] : [snapshot.score]))
+  const comments = ordered.flatMap((snapshot) => (snapshot.comments === null ? [] : [snapshot.comments]))
+  const ranks = ordered.flatMap((snapshot) => (snapshot.topRank === null ? [] : [snapshot.topRank]))
+  let maxGap = 0
+  let frontPage = 0
+  for (let index = 1; index < ordered.length; index++) {
+    const gap = ordered[index].observedAt - ordered[index - 1].observedAt
+    maxGap = Math.max(maxGap, gap)
+    const rank = ordered[index - 1].topRank
+    if (rank !== null && rank <= FRONT_PAGE_RANK) frontPage += Math.min(gap, FRONT_PAGE_GAP_CAP)
+  }
+  return {
+    firstObservedAt: ordered[0].observedAt,
+    lastObservedAt: ordered[ordered.length - 1].observedAt,
+    maxGapMinutes: maxGap / MINUTE,
+    maxScore: scores.length ? Math.max(...scores) : null,
+    maxComments: comments.length ? Math.max(...comments) : null,
+    finalScore: scores.length ? scores[scores.length - 1] : null,
+    finalComments: comments.length ? comments[comments.length - 1] : null,
+    bestRank: ranks.length ? Math.min(...ranks) : null,
+    frontPageMinutes: frontPage / MINUTE,
   }
 }
 

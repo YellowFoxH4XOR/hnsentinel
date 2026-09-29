@@ -122,4 +122,6 @@ export interface Status {
   storiesTracked: number
   risingCount: number
   latestSignalAt: number | null
+  /** Stories whose first-day trajectory is in the long-term archive. */
+  trajectoriesArchived: number
 }

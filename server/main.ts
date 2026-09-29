@@ -45,6 +45,7 @@ const status: Status = {
   storiesTracked: 0,
   risingCount: 0,
   latestSignalAt: null,
+  trajectoriesArchived: store.trajectoryCount(),
 }
 
 function rebuildDashboard(): void {
@@ -125,6 +126,16 @@ const collector = new Collector({
         store.pruneIfNeeded(Date.now())
       } catch (error) {
         log('Could not rebuild the dashboard', error)
+      }
+      try {
+        // Keep each story's first day before its raw snapshots are pruned.
+        const archived = store.archiveTrajectories(Date.now())
+        if (archived) {
+          status.trajectoriesArchived = store.trajectoryCount()
+          log(`Archived ${archived} story trajectories (${status.trajectoriesArchived} total)`)
+        }
+      } catch (error) {
+        log('Could not archive trajectories', error)
       }
       checkBrief()
       hub.broadcast('update', status)

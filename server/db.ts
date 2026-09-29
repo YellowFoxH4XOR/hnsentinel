@@ -92,6 +92,34 @@ const MIGRATIONS: string[] = [
     value TEXT NOT NULL
   );
   `,
+  // 2: long-term story trajectories, kept after raw snapshots are pruned.
+  `
+  CREATE TABLE trajectories (
+    story_id INTEGER PRIMARY KEY,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    domain TEXT,
+    author TEXT,
+    created_at INTEGER NOT NULL,
+    archived_at INTEGER NOT NULL,
+    samples INTEGER NOT NULL,
+    first_observed_at INTEGER NOT NULL,
+    last_observed_at INTEGER NOT NULL,
+    max_gap_minutes REAL NOT NULL,
+    max_score INTEGER,
+    max_comments INTEGER,
+    final_score INTEGER,
+    final_comments INTEGER,
+    best_rank INTEGER,
+    front_page_minutes REAL NOT NULL,
+    dead INTEGER NOT NULL,
+    deleted INTEGER NOT NULL,
+    series_version INTEGER NOT NULL,
+    series BLOB NOT NULL
+  );
+  CREATE INDEX trajectories_created ON trajectories(created_at);
+  CREATE INDEX stories_created ON stories(created_at);
+  `,
 ]
 
 export function openDatabase(file: string): Database {

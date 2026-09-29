@@ -74,6 +74,10 @@ per day.
 - Signals: 30 days.
 - Briefs: 90 days.
 - Stories: 60 days after they were last observed.
+- Trajectories: kept indefinitely. When a story or poll turns a day old, its first 24 hours
+  are archived (5-minute samples for 6 hours, then every 30 minutes) together with outcome
+  figures such as peak score, best front-page rank, and time on the front page. This is the
+  long-term dataset for future trend and prediction work.
 
 **Per-reader state stays in the browser:** the Saved list, which Signals have been seen, and
 the theme. There are no accounts.
